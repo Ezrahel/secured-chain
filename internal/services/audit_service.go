@@ -5,15 +5,16 @@ import (
 	"auth-service/internal/db"
 	"auth-service/internal/models"
 	"context"
-	"database/sql"
 	"encoding/json"
 	"fmt"
 	"net"
 	"net/http"
+	"net/netip"
 	"strings"
 	"time"
 
 	"github.com/google/uuid"
+	"github.com/jackc/pgx/v5/pgtype"
 )
 
 type AuditService struct {
@@ -53,17 +54,25 @@ func (s *AuditService) LogEvent(ctx context.Context, event *models.AuditEvent) e
 	hash := s.cryptoService.GenerateHashChain(prevHash, []byte(eventData))
 
 	// Parse user ID
-	var userID uuid.NullUUID
+	var userID pgtype.UUID
 	if event.UserID != "" {
 		if id, err := uuid.Parse(event.UserID); err == nil {
-			userID = uuid.NullUUID{UUID: id, Valid: true}
+			userID = pgtype.UUID{
+				Bytes: id,
+				Valid: true,
+			}
 		}
 	}
 
 	// Parse IP address
-	var ipAddr net.IP
+	var ipAddr netip.Addr
+	var ipAddrPtr *netip.Addr
 	if event.IPAddress != "" {
-		ipAddr = net.ParseIP(event.IPAddress)
+		parsedIP := net.ParseIP(event.IPAddress)
+		if addr, err := ipToNetipAddr(parsedIP); err == nil {
+			ipAddr = addr
+			ipAddrPtr = &ipAddr
+		}
 	}
 
 	// Store audit log
@@ -71,10 +80,13 @@ func (s *AuditService) LogEvent(ctx context.Context, event *models.AuditEvent) e
 		UserID:       userID,
 		EventType:    event.EventType,
 		EventPayload: payloadBytes,
-		IpAddress:    ipAddr,
-		UserAgent:    sql.NullString{String: event.UserAgent, Valid: event.UserAgent != ""},
-		PrevHash:     prevHash,
-		Hash:         hash,
+		IpAddress:    ipAddrPtr,
+		UserAgent: pgtype.Text{
+			String: event.UserAgent,
+			Valid:  event.UserAgent != "",
+		},
+		PrevHash: prevHash,
+		Hash:     hash,
 	})
 
 	if err != nil {

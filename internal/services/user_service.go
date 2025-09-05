@@ -8,13 +8,14 @@ import (
 	"auth-service/internal/mail"
 	"auth-service/internal/models"
 	"context"
-	"database/sql"
 	"fmt"
 	"net"
 	"net/http"
+	"net/netip"
 	"strings"
 	"time"
-	// "github.com/google/uuid"
+
+	"github.com/jackc/pgx/v5/pgtype"
 )
 
 type UserService struct {
@@ -35,6 +36,16 @@ func NewUserService(queries *db.Queries, cryptoService *crypto.Service, mailServ
 	}
 }
 
+func ipToNetipAddr(ip net.IP) (netip.Addr, error) {
+	if ip == nil {
+		return netip.Addr{}, fmt.Errorf("nil IP address")
+	}
+	addr, err := netip.ParseAddr(ip.String())
+	if err != nil {
+		return netip.Addr{}, err
+	}
+	return addr, nil
+}
 func (s *UserService) Signup(ctx context.Context, req *models.SignupRequest, r *http.Request) (*models.SignupResponse, error) {
 	// Validate input
 	if err := s.validateSignupRequest(req); err != nil {
@@ -83,13 +94,25 @@ func (s *UserService) Signup(ctx context.Context, req *models.SignupRequest, r *
 	expiresAt := time.Now().Add(s.config.EmailTokenExpiry)
 
 	// Store email token
+	ipAddr, err := ipToNetipAddr(s.getClientIP(r))
+	if err != nil {
+		return nil, fmt.Errorf("failed to parse client IP: %w", err)
+	}
+
 	_, err = s.queries.CreateEmailToken(ctx, db.CreateEmailTokenParams{
 		UserID:    user.ID,
 		TokenHash: tokenHash,
 		Purpose:   "email_confirm",
-		ExpiresAt: expiresAt,
-		IpAddress: s.getClientIP(r),
-		UserAgent: sql.NullString{String: r.UserAgent(), Valid: true},
+		ExpiresAt: pgtype.Timestamptz{
+			Time:             expiresAt,
+			Valid:            true,
+			InfinityModifier: pgtype.Finite,
+		},
+		IpAddress: &ipAddr,
+		UserAgent: pgtype.Text{
+			String: r.UserAgent(),
+			Valid:  true,
+		},
 	})
 	if err != nil {
 		return nil, fmt.Errorf("failed to create email token: %w", err)
@@ -132,11 +155,15 @@ func (s *UserService) Login(ctx context.Context, req *models.LoginRequest, r *ht
 		s.queries.IncrementFailedLoginAttempts(ctx, user.ID)
 
 		// Lock account if too many failed attempts
-		if user.FailedLoginAttempts+1 >= int32(s.config.MaxLoginAttempts) {
+		if user.FailedLoginAttempts.Int32+1 >= int32(s.config.MaxLoginAttempts) {
 			lockUntil := time.Now().Add(s.config.LockoutDuration)
 			s.queries.LockUser(ctx, db.LockUserParams{
-				ID:          user.ID,
-				LockedUntil: sql.NullTime{Time: lockUntil, Valid: true},
+				ID: user.ID,
+				LockedUntil: pgtype.Timestamptz{
+					Time:             lockUntil,
+					InfinityModifier: pgtype.Finite,
+					Valid:            true,
+				},
 			})
 		}
 
@@ -145,12 +172,12 @@ func (s *UserService) Login(ctx context.Context, req *models.LoginRequest, r *ht
 	}
 
 	// Check if email is verified
-	if !user.EmailVerified {
+	if !user.EmailVerified.Valid || !user.EmailVerified.Bool {
 		return nil, fmt.Errorf("email not verified. Please check your email for confirmation link")
 	}
 
 	// Reset failed login attempts on successful login
-	if user.FailedLoginAttempts > 0 {
+	if user.FailedLoginAttempts.Int32 > 0 {
 		s.queries.UnlockUser(ctx, user.ID)
 	}
 
@@ -170,14 +197,32 @@ func (s *UserService) Login(ctx context.Context, req *models.LoginRequest, r *ht
 
 	// Store refresh token
 	refreshTokenHash := s.authService.HashToken(tokenPair.RefreshToken)
+	clientIP, err := ipToNetipAddr(s.getClientIP(r))
+	if err != nil {
+		return nil, fmt.Errorf("failed to parse client IP: %w", err)
+	}
+
 	_, err = s.queries.CreateAuthToken(ctx, db.CreateAuthTokenParams{
-		UserID:            user.ID,
-		TokenHash:         refreshTokenHash,
-		DeviceID:          sql.NullString{String: req.DeviceID, Valid: req.DeviceID != ""},
-		IpAddress:         s.getClientIP(r),
-		UserAgent:         sql.NullString{String: r.UserAgent(), Valid: true},
-		ExpiresAt:         time.Now().Add(time.Hour * 24 * 7), // 7 days
-		DeviceFingerprint: sql.NullString{String: deviceFingerprint, Valid: true},
+		UserID:    user.ID,
+		TokenHash: refreshTokenHash,
+		DeviceID: pgtype.Text{
+			String: req.DeviceID,
+			Valid:  req.DeviceID != "",
+		},
+		IpAddress: &clientIP, // Pass pointer to IP address
+		UserAgent: pgtype.Text{
+			String: r.UserAgent(),
+			Valid:  true,
+		},
+		ExpiresAt: pgtype.Timestamptz{
+			Time:             time.Now().Add(time.Hour * 24 * 7), // 7 days
+			Valid:            true,
+			InfinityModifier: pgtype.Finite,
+		},
+		DeviceFingerprint: pgtype.Text{
+			String: deviceFingerprint,
+			Valid:  true,
+		},
 	})
 	if err != nil {
 		return nil, fmt.Errorf("failed to store refresh token: %w", err)
@@ -317,10 +362,20 @@ func (s *UserService) checkPasswordBreach(ctx context.Context, password string) 
 }
 
 func (s *UserService) recordFailedLoginAttempt(ctx context.Context, usernameOrEmail string, r *http.Request) {
+	clientIP, err := ipToNetipAddr(s.getClientIP(r))
+	if err != nil {
+		// Log the error but don't fail the operation
+		fmt.Printf("failed to parse client IP: %v\n", err)
+		return
+	}
+
 	s.queries.CreateFailedLoginAttempt(ctx, db.CreateFailedLoginAttemptParams{
-		IpAddress:       s.getClientIP(r),
+		IpAddress:       clientIP,
 		UsernameOrEmail: usernameOrEmail,
-		UserAgent:       sql.NullString{String: r.UserAgent(), Valid: true},
+		UserAgent: pgtype.Text{
+			String: r.UserAgent(),
+			Valid:  true,
+		},
 	})
 }
 

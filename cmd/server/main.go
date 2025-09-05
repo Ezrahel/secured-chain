@@ -2,7 +2,6 @@ package main
 
 import (
 	"context"
-	"database/sql"
 	"fmt"
 	"log"
 	"net/http"
@@ -21,9 +20,9 @@ import (
 	"auth-service/internal/services"
 
 	"github.com/gorilla/mux"
+	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/redis/go-redis/v9"
 	"github.com/rs/cors"
-	_ "github.com/lib/pq"
 )
 
 func main() {
@@ -33,15 +32,20 @@ func main() {
 		log.Fatal("Failed to load configuration:", err)
 	}
 
-	// Initialize database
-	database, err := sql.Open("postgres", cfg.DatabaseURL)
+	// Initialize database connection pool
+	dbconfig, err := pgxpool.ParseConfig(cfg.DatabaseURL)
 	if err != nil {
-		log.Fatal("Failed to connect to database:", err)
+		log.Fatal("Failed to parse database config:", err)
 	}
-	defer database.Close()
+
+	pool, err := pgxpool.NewWithConfig(context.Background(), dbconfig)
+	if err != nil {
+		log.Fatal("Failed to create connection pool:", err)
+	}
+	defer pool.Close()
 
 	// Test database connection
-	if err := database.Ping(); err != nil {
+	if err := pool.Ping(context.Background()); err != nil {
 		log.Fatal("Failed to ping database:", err)
 	}
 
@@ -60,7 +64,7 @@ func main() {
 	}
 
 	// Initialize database queries
-	queries := db.New(database)
+	queries := db.New(pool)
 
 	// Initialize services
 	cryptoService := crypto.NewService(cfg.EncryptionKey)
@@ -77,7 +81,7 @@ func main() {
 
 	// Setup router
 	router := mux.NewRouter()
-	
+
 	// Apply global middleware
 	router.Use(middlewareManager.RequestLogger)
 	router.Use(middlewareManager.Recovery)
@@ -91,10 +95,10 @@ func main() {
 		AllowedHeaders:   cfg.CORS.AllowedHeaders,
 		AllowCredentials: true,
 	})
-	
+
 	// API routes
 	api := router.PathPrefix("/api/v1").Subrouter()
-	
+
 	// Public routes
 	api.HandleFunc("/signup", handlers.Signup).Methods("POST")
 	api.HandleFunc("/login", handlers.Login).Methods("POST")
@@ -106,7 +110,7 @@ func main() {
 	// Protected routes
 	protected := api.PathPrefix("").Subrouter()
 	protected.Use(middlewareManager.Authenticate)
-	
+
 	protected.HandleFunc("/logout", handlers.Logout).Methods("POST")
 	protected.HandleFunc("/sessions", handlers.GetSessions).Methods("GET")
 	protected.HandleFunc("/sessions/revoke", handlers.RevokeSession).Methods("POST")

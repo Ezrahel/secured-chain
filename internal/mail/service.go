@@ -7,6 +7,7 @@ import (
 	"crypto/tls"
 	"fmt"
 	"html/template"
+	"io"
 	"net"
 	"net/smtp"
 	"time"
@@ -38,19 +39,25 @@ type Dialer interface {
 	DialAndSend(messages ...*gomail.Message) error
 }
 
+func NewCustomDialer(host string, port int, username, password string, timeout time.Duration) *customDialer {
+	return &customDialer{
+		Dialer:  gomail.NewDialer(host, port, username, password),
+		timeout: timeout,
+	}
+}
 func (d *customDialer) Dial() (gomail.SendCloser, error) {
 	netDialer := &net.Dialer{
 		Timeout: d.timeout,
 	}
 
-	addr := fmt.Sprintf("%s:%d", d.Host, d.Port)
+	addr := fmt.Sprintf("%s:%d", d.Dialer.Host, d.Dialer.Port)
 	conn, err := netDialer.Dial("tcp", addr)
 	if err != nil {
 		return nil, fmt.Errorf("failed to dial: %w", err)
 	}
 
-	if d.Port == 465 { // SMTPS
-		tlsConn := tls.Client(conn, d.TLSConfig)
+	if d.Dialer.Port == 465 { // SMTPS
+		tlsConn := tls.Client(conn, d.Dialer.TLSConfig)
 		if err := tlsConn.HandshakeContext(context.Background()); err != nil {
 			conn.Close()
 			return nil, fmt.Errorf("TLS handshake failed: %w", err)
@@ -58,15 +65,14 @@ func (d *customDialer) Dial() (gomail.SendCloser, error) {
 		conn = tlsConn
 	}
 
-	// Create SMTP client
-	client, err := smtp.NewClient(conn, d.Host)
+	client, err := smtp.NewClient(conn, d.Dialer.Host)
 	if err != nil {
 		conn.Close()
 		return nil, fmt.Errorf("failed to create SMTP client: %w", err)
 	}
 
-	if d.User != "" {
-		auth := smtp.PlainAuth("", d.User, d.Password, d.Host)
+	if d.Dialer.Username != "" {
+		auth := smtp.PlainAuth("", d.Dialer.Username, d.Dialer.Password, d.Dialer.Host)
 		if err := client.Auth(auth); err != nil {
 			client.Close()
 			return nil, fmt.Errorf("failed to authenticate: %w", err)
@@ -81,25 +87,42 @@ type smtpSendCloser struct {
 	*smtp.Client
 }
 
-func (s *smtpSendCloser) Send(from string, to []string, msg []byte) error {
-	if err := s.Mail(from); err != nil {
+func (d *customDialer) DialAndSend(m ...*gomail.Message) error {
+	s, err := d.Dial()
+	if err != nil {
 		return err
 	}
-	for _, addr := range to {
-		if err := s.Rcpt(addr); err != nil {
+	defer s.Close()
+
+	for _, msg := range m {
+		if err := gomail.Send(s, msg); err != nil {
 			return err
 		}
 	}
+	return nil
+}
+func (s *smtpSendCloser) Send(from string, to []string, msg io.WriterTo) error {
+	if err := s.Mail(from); err != nil {
+		return fmt.Errorf("failed to set FROM address: %w", err)
+	}
+
+	for _, addr := range to {
+		if err := s.Rcpt(addr); err != nil {
+			return fmt.Errorf("failed to add recipient %s: %w", addr, err)
+		}
+	}
+
 	w, err := s.Data()
 	if err != nil {
-		return err
+		return fmt.Errorf("failed to create message writer: %w", err)
 	}
-	_, err = w.Write(msg)
-	if err != nil {
-		w.Close()
-		return err
+	defer w.Close()
+
+	if _, err := msg.WriteTo(w); err != nil {
+		return fmt.Errorf("failed to write message: %w", err)
 	}
-	return w.Close()
+
+	return nil
 }
 
 func (s *smtpSendCloser) Close() error {
@@ -123,7 +146,7 @@ func NewService(config config.SMTPConfig) *Service {
 
 	return &Service{
 		config: config,
-		dialer: dialer, // Now this works because customDialer implements Dialer interface
+		dialer: dialer.Dialer, // Now this works because customDialer implements Dialer interface
 	}
 }
 func (s *Service) SendConfirmationEmail(to, name, token, confirmURL string) error {
